@@ -1,0 +1,443 @@
+CODE:
+
+FOR NODE 1:
+
+from machine import Pin, I2C, UART
+import time
+
+# =====================================================
+# SETTINGS
+# =====================================================
+SPI_PAYLOAD_SIZE = 64          # bytes, padded with spaces
+PREAMBLE = b'\xAA\xAA\xAA\xAA\x7E'
+HALF_BIT_US = 1000             # 1 ms per half clock (about 500 bit/s)
+CS_LEAD_MS = 100               # CS LOW before first clock
+CS_TAIL_MS = 50                # CS LOW after last clock
+UART_TO_SPI_GAP_MS = 300       # lets Node 2 finish UART work first
+LOOP_DELAY_MS = 500
+
+# =====================================================
+# 1. MPU6050 (I2C: SDA=21, SCL=22)
+# =====================================================
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
+MPU_ADDR = 0x68
+
+if MPU_ADDR not in i2c.scan():
+    print("ERROR: MPU6050 NOT FOUND")
+    raise Exception("Check MPU6050 wiring")
+
+print("MPU6050 CONNECTED")
+i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')   # wake up
+time.sleep_ms(100)
+
+# =====================================================
+# 2. UART (TX=17, RX=16)
+# =====================================================
+uart = UART(2, baudrate=115200, bits=8, parity=None, stop=1,
+            tx=Pin(17), rx=Pin(16))
+print("UART INITIALIZED")
+
+# =====================================================
+# 3. SOFTWARE SPI MASTER (MOSI=23, SCK=18, CS=5)
+# =====================================================
+mosi = Pin(23, Pin.OUT)
+sck = Pin(18, Pin.OUT)
+cs = Pin(5, Pin.OUT)
+
+mosi.value(0)
+sck.value(0)
+cs.value(1)
+print("SOFTWARE SPI MASTER INITIALIZED")
+
+
+# =====================================================
+# 4. MPU6050 READ
+# =====================================================
+def read_signed_16(data, index):
+    value = (data[index] << 8) | data[index + 1]
+    if value >= 32768:
+        value -= 65536
+    return value
+
+
+def read_mpu6050():
+    data = i2c.readfrom_mem(MPU_ADDR, 0x3B, 14)
+
+    ax = read_signed_16(data, 0) / 16384.0
+    ay = read_signed_16(data, 2) / 16384.0
+    az = read_signed_16(data, 4) / 16384.0
+
+    gx = read_signed_16(data, 8) / 131.0
+    gy = read_signed_16(data, 10) / 131.0
+    gz = read_signed_16(data, 12) / 131.0
+
+    return ax, ay, az, gx, gy, gz
+
+
+# =====================================================
+# 5. SPI SEND (mode 0, MSB first)
+# frame = preamble + 64-byte payload
+# =====================================================
+def spi_send(payload):
+    frame = PREAMBLE + payload
+
+    cs.value(0)
+    time.sleep_ms(CS_LEAD_MS)
+
+    for byte in frame:
+        for bit in range(7, -1, -1):
+            mosi.value((byte >> bit) & 1)
+            time.sleep_us(HALF_BIT_US)
+            sck.value(1)                 # rising edge: Node 2 samples
+            time.sleep_us(HALF_BIT_US)
+            sck.value(0)
+
+    time.sleep_ms(CS_TAIL_MS)
+    cs.value(1)
+    mosi.value(0)
+
+
+# =====================================================
+# 6. PACKET
+# Format: M,seq,ax,ay,az,gx,gy,gz
+# =====================================================
+def create_packet(counter, ax, ay, az, gx, gy, gz):
+    return "M,{},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f}".format(
+        counter, ax, ay, az, gx, gy, gz)
+
+
+# =====================================================
+# 7. STARTUP
+# =====================================================
+counter = 0
+
+print("\n================================")
+print("NODE 1 INDUSTRIAL SENSOR NODE")
+print("================================")
+time.sleep(1)
+
+# =====================================================
+# 8. MAIN LOOP
+# =====================================================
+while True:
+    try:
+        ax, ay, az, gx, gy, gz = read_mpu6050()
+        message = create_packet(counter, ax, ay, az, gx, gy, gz)
+
+        # --- UART first ---
+        uart.write(message + "\n")
+        print("UART SENT:", message)
+
+        # --- give Node 2 time to finish processing UART ---
+        time.sleep_ms(UART_TO_SPI_GAP_MS)
+
+        # --- SPI ---
+        payload = message.encode("ascii")
+        if len(payload) > SPI_PAYLOAD_SIZE:
+            print("SPI SKIPPED: packet too long", len(payload))
+        else:
+            payload += b' ' * (SPI_PAYLOAD_SIZE - len(payload))
+            spi_send(payload)
+            print("SPI SENT:", counter)
+
+        counter = (counter + 1) % 1000000
+        time.sleep_ms(LOOP_DELAY_MS)
+
+    except Exception as e:
+        cs.value(1)                      # never leave CS LOW on error
+        sck.value(0)
+        print("NODE 1 ERROR:", repr(e))
+        time.sleep_ms(1000)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+NODE 2:
+
+from machine import Pin, I2C, UART
+import time
+import ssd1306
+
+# =====================================================
+# SETTINGS
+# =====================================================
+DEBUG = True                   # prints SPI bit counts
+SPI_PAYLOAD_SIZE = 64
+FULL_FRAME_BITS = (5 + SPI_PAYLOAD_SIZE) * 8     # preamble + payload = 552
+SYNC = 0xAA7E                  # last 2 preamble bytes (AA 7E)
+MAX_BITS = 700
+SPI_TIMEOUT_MS = 500
+
+# =====================================================
+# 1. OLED (SDA=21, SCL=22)
+# =====================================================
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
+
+oled = None
+found = i2c.scan()
+for addr in (0x3C, 0x3D):
+    if addr in found:
+        oled = ssd1306.SSD1306_I2C(128, 64, i2c, addr)
+        break
+
+print("OLED INITIALIZED" if oled else "WARNING: OLED NOT FOUND, continuing")
+
+# =====================================================
+# 2. UART (Node 1 TX17 -> Node 2 RX16)
+# =====================================================
+uart = UART(2, baudrate=115200, bits=8, parity=None, stop=1,
+            tx=Pin(17), rx=Pin(16), rxbuf=1024)
+uart_buffer = b""
+print("UART INITIALIZED")
+
+# =====================================================
+# 3. SOFTWARE SPI SLAVE (mode 0: sample MOSI on rising edge)
+# =====================================================
+mosi = Pin(23, Pin.IN, Pin.PULL_DOWN)
+sck = Pin(18, Pin.IN, Pin.PULL_DOWN)
+cs = Pin(5, Pin.IN, Pin.PULL_UP)
+
+bits = bytearray(MAX_BITS)     # one bit per byte
+print("SOFTWARE SPI RECEIVER READY")
+
+# =====================================================
+# 4. GLOBALS
+# =====================================================
+uart_packets = 0
+spi_packets = 0
+invalid_packets = 0
+
+latest_source = "WAITING"
+latest_sequence = 0
+ax = ay = az = gx = gy = gz = 0.0
+display_dirty = True
+
+
+# =====================================================
+# 5. OLED DISPLAY
+# =====================================================
+def show_oled():
+    global display_dirty
+    display_dirty = False
+    if oled is None:
+        return
+    oled.fill(0)
+    oled.text("NODE2 GATEWAY", 0, 0)
+    oled.hline(0, 10, 128, 1)
+    oled.text("SRC:" + latest_source, 0, 13)
+    oled.text("SEQ:" + str(latest_sequence), 0, 23)
+    oled.text("A%5.2f%5.2f%5.2f" % (ax, ay, az), 0, 33)
+    oled.text("G%5.0f%5.0f%5.0f" % (gx, gy, gz), 0, 43)
+    oled.text("U:%d S:%d E:%d" % (uart_packets, spi_packets, invalid_packets), 0, 54)
+    oled.show()
+
+
+# =====================================================
+# 6. PACKET PARSING
+# Format: M,seq,ax,ay,az,gx,gy,gz
+# =====================================================
+def parse_packet(message):
+    parts = message.strip().split(",")
+    if len(parts) != 8 or parts[0] != "M":
+        return None
+    try:
+        return int(parts[1]), [float(p) for p in parts[2:8]]
+    except ValueError:
+        return None
+
+
+def process_packet(message, source):
+    global uart_packets, spi_packets, invalid_packets
+    global latest_source, latest_sequence, display_dirty
+    global ax, ay, az, gx, gy, gz
+
+    message = message.strip()
+    if not message:
+        return
+
+    result = parse_packet(message)
+    if result is None:
+        invalid_packets += 1
+        display_dirty = True
+        print("INVALID [%s]: %r" % (source, message))
+        return
+
+    seq, v = result
+    ax, ay, az, gx, gy, gz = v
+    latest_source = source
+    latest_sequence = seq
+
+    if source == "UART":
+        uart_packets += 1
+    else:
+        spi_packets += 1
+
+    print("%s #%d  A(%.2f, %.2f, %.2f)  G(%.2f, %.2f, %.2f)  OK" %
+          (source, seq, ax, ay, az, gx, gy, gz))
+
+    display_dirty = True
+
+
+# =====================================================
+# 7. UART RECEIVER
+# =====================================================
+def clean_ascii(raw):
+    return bytes([c for c in raw if 32 <= c < 127]).decode()
+
+
+def receive_uart():
+    global uart_buffer
+
+    if uart.any():
+        data = uart.read()
+        if data:
+            uart_buffer += data
+            if len(uart_buffer) > 1024:
+                uart_buffer = b""
+                return
+
+    while b"\n" in uart_buffer:
+        line, uart_buffer = uart_buffer.split(b"\n", 1)
+        text = clean_ascii(line)
+        idx = text.rfind("M,")          # skip boot noise before the packet
+        if idx > 0:
+            text = text[idx:]
+        if text:
+            process_packet(text, "UART")
+
+
+# =====================================================
+# 8. SOFTWARE SPI RECEIVER (preamble sync)
+# =====================================================
+def capture_spi_bits():
+    """Sample MOSI on each SCK rising edge until CS goes HIGH."""
+    n = 0
+
+    t0 = time.ticks_ms()
+    while sck.value() == 1:             # joined while clock HIGH: wait for LOW
+        if cs.value() == 1:
+            return 0
+        if time.ticks_diff(time.ticks_ms(), t0) > SPI_TIMEOUT_MS:
+            return 0
+
+    while True:
+        t0 = time.ticks_ms()
+        while sck.value() == 0:         # wait rising edge
+            if cs.value() == 1:
+                return n
+            if time.ticks_diff(time.ticks_ms(), t0) > SPI_TIMEOUT_MS:
+                return n
+
+        if n < MAX_BITS:
+            bits[n] = mosi.value()
+            n += 1
+
+        t0 = time.ticks_ms()
+        while sck.value() == 1:         # wait falling edge
+            if cs.value() == 1:
+                return n
+            if time.ticks_diff(time.ticks_ms(), t0) > SPI_TIMEOUT_MS:
+                return n
+
+
+def decode_spi(n):
+    """Find the AA 7E preamble in the bit stream, decode payload after it."""
+    w = 0
+    start = -1
+    for i in range(n):
+        w = ((w << 1) | bits[i]) & 0xFFFF
+        if i >= 15 and w == SYNC:
+            start = i + 1
+            break
+
+    if start < 0:
+        return None
+
+    nbytes = (n - start) // 8
+    if nbytes < 20:
+        return None
+
+    out = bytearray(nbytes)
+    for i in range(nbytes):
+        v = 0
+        base = start + i * 8
+        for j in range(8):
+            v = (v << 1) | bits[base + j]
+        out[i] = v
+
+    for c in out:
+        if c < 32 or c > 126:
+            return None
+
+    return out.decode().strip()
+
+
+def receive_spi_packet():
+    global invalid_packets, display_dirty
+
+    n = capture_spi_bits()
+
+    t0 = time.ticks_ms()                # wait for CS HIGH
+    while cs.value() == 0:
+        if time.ticks_diff(time.ticks_ms(), t0) > 2000:
+            break
+        time.sleep_ms(1)
+
+    if n < 64:
+        return                          # partial or garbage frame
+
+    if DEBUG:
+        print("SPI BITS:", n, "(full frame =", FULL_FRAME_BITS, ")")
+
+    msg = decode_spi(n)
+    if msg and parse_packet(msg):
+        process_packet(msg, "SPI")
+    else:
+        invalid_packets += 1
+        display_dirty = True
+        print("SPI FAILED, bits:", n, "decoded:", repr(msg))
+
+
+# =====================================================
+# 9. STARTUP
+# =====================================================
+if oled:
+    oled.fill(0)
+    oled.text("INDUSTRIAL", 20, 5)
+    oled.text("GATEWAY NODE 2", 10, 20)
+    oled.text("UART READY", 20, 38)
+    oled.text("SPI READY", 20, 50)
+    oled.show()
+
+print("\n================================")
+print("NODE 2 INDUSTRIAL GATEWAY")
+print("================================")
+
+time.sleep(2)
+show_oled()
+
+# =====================================================
+# 10. MAIN LOOP
+# =====================================================
+while True:
+    if cs.value() == 0:                 # SPI has priority
+        receive_spi_packet()
+    else:
+        receive_uart()
+        if display_dirty and cs.value() == 1:
+            show_oled()
+
+    time.sleep_ms(1)
